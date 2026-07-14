@@ -1,0 +1,8 @@
+node_modules/
+dist/
+*.tgz
+.env
+vedis.db
+vedis-audit.jsonl
+*.jsonl
+*.log
