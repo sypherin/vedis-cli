@@ -1,9 +1,18 @@
-import { appendFileSync, mkdirSync } from 'node:fs';
+import { createWriteStream, mkdirSync, type WriteStream } from 'node:fs';
 import { dirname } from 'node:path';
 import type { AuditConfig, AuditEntry } from '../types.js';
 
 export class AuditLogger {
   private jsonlPath: string | null;
+  private stream: WriteStream | null = null;
+  private streamBroken = false;
+  /**
+   * Writes issued but not yet drained. `log()` is on the MCP tool-call hot path and the old
+   * implementation paid a synchronous appendFileSync per entry — this counter is what
+   * `flushed()` waits on so shutdown can prove nothing was truncated (and so the micro-bench
+   * can measure the hot path instead of asserting it is fast).
+   */
+  private pendingWrites = 0;
   private db: unknown = null;
   private insertStmt: unknown = null;
 
@@ -13,6 +22,10 @@ export class AuditLogger {
 
     if (this.jsonlPath) {
       mkdirSync(dirname(this.jsonlPath) || '.', { recursive: true });
+      // One async handle for the process lifetime: `open()` opens once and lets libuv
+      // enqueue writes, so a tool call no longer blocks on a fsync-class syscall.
+      this.stream = createWriteStream(this.jsonlPath, { flags: 'a' });
+      this.stream.on('error', () => { this.streamBroken = true; });
     }
 
     // SQLite is optional — only init if configured
@@ -56,11 +69,14 @@ export class AuditLogger {
   }
 
   log(entry: AuditEntry): void {
-    // JSONL output
-    if (this.jsonlPath) {
+    // JSONL output — async, so the tool call is not charged for the write.
+    if (this.jsonlPath && this.stream && !this.streamBroken) {
       try {
-        appendFileSync(this.jsonlPath, JSON.stringify(entry) + '\n');
-      } catch { /* best effort */ }
+        this.pendingWrites++;
+        this.stream.write(JSON.stringify(entry) + '\n', () => { this.pendingWrites--; });
+      } catch {
+        this.pendingWrites--;
+      }
     }
 
     // SQLite output
@@ -80,7 +96,27 @@ export class AuditLogger {
     }
   }
 
+  /**
+   * Resolves once every write handed to the stream has actually been flushed to the OS.
+   * Used by the micro-bench and by close(); a proxy exit must not truncate the log.
+   */
+  drained(): Promise<void> {
+    if (!this.stream || this.streamBroken) return Promise.resolve();
+    if (this.pendingWrites === 0) return Promise.resolve();
+    return new Promise((resolve) => {
+      const tick = () => {
+        if (this.pendingWrites <= 0) resolve();
+        else setTimeout(tick, 5);
+      };
+      tick();
+    });
+  }
+
   close(): void {
+    if (this.stream) {
+      try { this.stream.end(); } catch { /* */ }
+      this.stream = null;
+    }
     if (this.db) {
       try { (this.db as { close: () => void }).close(); } catch { /* */ }
     }

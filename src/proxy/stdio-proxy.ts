@@ -7,7 +7,23 @@ import { OutputFilter } from '../middleware/filter.js';
 import { AuditLogger } from '../middleware/audit.js';
 import { RateLimiter } from '../middleware/rate-limiter.js';
 import { BrainClient } from '../middleware/brain.js';
+import { Forwarder } from './forwarder.js';
 import chalk from 'chalk';
+import { randomUUID } from 'node:crypto';
+import { buildCallEvent, type EventSeed } from './ingest-record.js';
+
+/** Text of an MCP tool result, for the response_digest / response_bytes columns. */
+function responseTextOf(result: unknown): string | null {
+  if (result === null || result === undefined) return null;
+  const content = (result as { content?: unknown }).content;
+  if (Array.isArray(content)) {
+    return content
+      .filter((c) => typeof (c as { text?: unknown })?.text === 'string')
+      .map((c) => String((c as { text?: unknown }).text))
+      .join('\n');
+  }
+  try { return JSON.stringify(result); } catch { return null; }
+}
 
 export class StdioProxy {
   private upstream: ChildProcess | null = null;
@@ -17,8 +33,13 @@ export class StdioProxy {
   private audit: AuditLogger;
   private rateLimiter: RateLimiter;
   private brain: BrainClient;
+  private forwarder: Forwarder | null;
+  private readonly sessionId: string;
+  private eventSeq = 0;
+  /** Request-side decision, held until the response arrives so one call == one record. */
+  private pendingIngestSeed = new Map<string | number, EventSeed>();
   private config: VedisConfig;
-  private pendingRequests = new Map<string | number, { method: string; tool?: string; startTime: number }>();
+  private pendingRequests = new Map<string | number, { method: string; tool?: string; startTime: number; args?: Record<string, unknown> }>();
 
   constructor(config: VedisConfig) {
     this.config = config;
@@ -28,6 +49,21 @@ export class StdioProxy {
     this.audit = new AuditLogger(config.audit);
     this.rateLimiter = new RateLimiter(config.rateLimit);
     this.brain = new BrainClient(config.brain);
+    this.sessionId = `sess_${randomUUID()}`;
+
+    // Telemetry only. Absent endpoint => null, and the proxy behaves exactly as before.
+    const ingest = config.ingest;
+    this.forwarder = config.ingest?.enabled && config.ingest?.endpoint
+      ? new Forwarder({
+          endpoint: config.ingest.endpoint!,
+          keyId: ingest?.keyId,
+          apiKey: ingest?.apiKey,
+          clientVersion: ingest?.clientVersion,
+          proxyId: ingest?.proxyId,
+          queueCap: ingest?.queueCap,
+          spoolPath: ingest?.spoolPath,
+        })
+      : null;
   }
 
   async start(): Promise<void> {
@@ -80,19 +116,33 @@ export class StdioProxy {
     });
 
     process.stdin.on('end', () => {
-      this.upstream?.kill();
-      this.audit.close();
+      void this.drainAndExit(this.upstream, 0);
     });
 
     // Graceful shutdown
     const shutdown = () => {
       console.error(chalk.yellow('[vedis] Shutting down...'));
-      this.upstream?.kill();
-      this.audit.close();
-      process.exit(0);
+      void this.drainAndExit(this.upstream, 0);
     };
     process.on('SIGTERM', shutdown);
     process.on('SIGINT', shutdown);
+  }
+
+  /**
+   * Give the forwarder and the audit stream a bounded window to flush before exiting.
+   * Bounded: a cockpit that is unreachable must never hold the proxy open past the timeout
+   * (unspooled records survive in the spool either way, so exiting early loses nothing).
+   */
+  private async drainAndExit(upstream: ChildProcess | null, code: number): Promise<void> {
+    try {
+      await Promise.all([
+        this.forwarder?.close(2000) ?? Promise.resolve(),
+        this.audit.drained(),
+      ]);
+    } catch { /* fail open */ }
+    this.audit.close();
+    upstream?.kill();
+    process.exit(code);
   }
 
   private async handleClientMessage(msg: JsonRpcMessage): Promise<void> {
@@ -114,10 +164,16 @@ export class StdioProxy {
       if (req.method === 'tools/call') {
         const params = req.params as unknown as ToolCallParams;
         const toolName = params?.name ?? 'unknown';
+        let requestRedacted = false;
 
         // Track pending request
         if (req.id !== undefined) {
-          this.pendingRequests.set(req.id, { method: req.method, tool: toolName, startTime });
+          this.pendingRequests.set(req.id, {
+            method: req.method,
+            tool: toolName,
+            startTime,
+            args: (params?.arguments ?? undefined) as Record<string, unknown> | undefined,
+          });
         }
 
         // 1. Policy check
@@ -132,6 +188,14 @@ export class StdioProxy {
             blocked: true,
             threats: [],
             filtered: [],
+            latencyMs: Date.now() - startTime,
+          });
+          this.emitCall({
+            tool: toolName,
+            args: (params?.arguments ?? undefined) as Record<string, unknown> | undefined,
+            verdict: 'deny',
+            reason: policyResult.reason,
+            policyHits: ['policy'],
             latencyMs: Date.now() - startTime,
           });
           this.sendError(req, -32001, `Vedis policy: ${policyResult.reason}`);
@@ -151,6 +215,16 @@ export class StdioProxy {
             blocked: true,
             threats: scanResult.threats,
             filtered: [],
+            latencyMs: Date.now() - startTime,
+          });
+          this.emitCall({
+            tool: toolName,
+            args: (params?.arguments ?? undefined) as Record<string, unknown> | undefined,
+            verdict: 'deny',
+            reason: `scanner: ${threatNames}`,
+            policyHits: ['scanner'],
+            injectionScore: scanResult.score,
+            injectionTier: this.tierForScore(scanResult.score),
             latencyMs: Date.now() - startTime,
           });
           this.sendError(req, -32002, `Vedis scanner: potential injection detected (${threatNames})`);
@@ -185,6 +259,16 @@ export class StdioProxy {
               filtered: [],
               latencyMs: Date.now() - startTime,
             });
+            this.emitCall({
+              tool: toolName,
+              args: (params?.arguments ?? undefined) as Record<string, unknown> | undefined,
+              verdict: 'deny',
+              reason: `brain: ${types}`,
+              policyHits: ['brain'],
+              injectionScore: scanResult.score,
+              injectionTier: this.tierForScore(scanResult.score),
+              latencyMs: Date.now() - startTime,
+            });
             this.sendError(req, -32003, `Vedis brain: ${types}`);
             return;
           } else if (verdict?.verdict === 'redact' && verdict.redactions.length > 0) {
@@ -192,6 +276,7 @@ export class StdioProxy {
             for (const r of verdict.redactions) if (r) s = s.split(r).join('[REDACTED]');
             try { req.params = JSON.parse(s); } catch { /* keep original args */ }
             console.error(chalk.magenta(`[vedis] Brain redacted ${verdict.redactions.length} span(s) in ${toolName} args`));
+            requestRedacted = true;
           }
         }
 
@@ -206,6 +291,29 @@ export class StdioProxy {
           filtered: [],
           latencyMs: Date.now() - startTime,
         });
+
+        // Allowed (possibly flagged) — the record is completed on the response path,
+        // which owns the verdict plus the response digest. A request that gets no
+        // response never emits a record; the forwarder spool is for transport loss,
+        // not for upstreams that never answered.
+        if (req.id !== undefined) {
+          const p = this.pendingRequests.get(req.id);
+          if (p) {
+            this.pendingIngestSeed.set(req.id, {
+              tool: toolName,
+              args: (params?.arguments ?? undefined) as Record<string, unknown> | undefined,
+              verdict: scanResult.threats.length > 0 ? 'flag' : 'allow',
+              reason: scanResult.threats.length > 0
+                ? `scanner: ${scanResult.threats.map((t) => t.type).join(', ')}`
+                : '',
+              policyHits: scanResult.threats.length > 0 ? ['scanner:flag'] : null,
+              injectionScore: scanResult.score,
+              injectionTier: this.tierForScore(scanResult.score),
+              latencyMs: Date.now() - startTime,
+              redacted: requestRedacted,
+            });
+          }
+        }
       } else if (req.id !== undefined) {
         this.pendingRequests.set(req.id, { method: req.method, startTime });
       }
@@ -219,9 +327,11 @@ export class StdioProxy {
     if (isResponse(msg)) {
       const resp = msg as JsonRpcResponse;
       const pending = resp.id !== undefined ? this.pendingRequests.get(resp.id) : undefined;
+      const seed = resp.id !== undefined ? this.pendingIngestSeed.get(resp.id) : undefined;
 
       if (pending) {
         this.pendingRequests.delete(resp.id);
+        if (resp.id !== undefined) this.pendingIngestSeed.delete(resp.id);
 
         // Tool results only — this is where untrusted EXTERNAL content arrives.
         if (pending.method === 'tools/call' && resp.result) {
@@ -241,6 +351,7 @@ export class StdioProxy {
           const checkResponse =
             this.brain.isEnabled && (this.brain.mode !== 'flagged' || filtered.length > 0);
           let brainBlocked = false;
+          let outputRedacted = false;
           if (checkResponse) {
             const verdict = await this.brain.analyze({
               direction: 'response',
@@ -258,6 +369,7 @@ export class StdioProxy {
               for (const r of verdict.redactions) if (r) s = s.split(r).join('[REDACTED]');
               try { resp.result = JSON.parse(s); } catch { /* keep locally-filtered result */ }
               console.error(chalk.magenta(`[vedis] Brain redacted ${verdict.redactions.length} span(s) in ${pending.tool} output`));
+              outputRedacted = true;
             }
           }
 
@@ -271,12 +383,47 @@ export class StdioProxy {
             filtered,
             latencyMs: Date.now() - pending.startTime,
           });
+
+          // One ingest record per tool call, carrying the final verdict + response digest.
+          this.emitCall({
+            tool: pending.tool ?? 'unknown',
+            verdict: brainBlocked ? 'deny' : (seed?.verdict ?? 'allow'),
+            reason: brainBlocked ? 'brain blocked tool output' : (seed?.reason ?? ''),
+            policyHits: brainBlocked ? ['brain:response'] : (seed?.policyHits ?? null),
+            latencyMs: Date.now() - pending.startTime,
+            redacted: filtered.length > 0 || outputRedacted || Boolean(seed?.redacted),
+            responseText: responseTextOf(resp.result),
+          });
         }
       }
     }
 
     // Forward to client
     process.stdout.write(serializeMessage(msg));
+  }
+
+  /**
+   * Fold a tool call into exactly one ingest record and hand it to the forwarder.
+   * Never throws, never awaited: telemetry must not add latency or break a call (§7).
+   */
+  private emitCall(seed: EventSeed): void {
+    if (!this.forwarder) return;
+    try {
+      this.forwarder.enqueue(buildCallEvent(this.nextEventId(), this.sessionId, seed));
+    } catch {
+      /* fail open — a telemetry bug must never surface to the agent */
+    }
+  }
+
+  private nextEventId(): string {
+    return `call_${this.sessionId.slice(5, 13)}_${(this.eventSeq += 1)}`;
+  }
+
+  /** Coarse injection tier for the record's injection_tier column. */
+  private tierForScore(score: number): 'low' | 'medium' | 'high' {
+    if (score >= 0.7) return 'high';
+    if (score >= 0.4) return 'medium';
+    return 'low';
   }
 
   private sendError(req: JsonRpcRequest, code: number, message: string): void {

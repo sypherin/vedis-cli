@@ -20,6 +20,8 @@
     "prepare": "npm run build",
     "dev": "tsx src/cli.ts",
     "start": "node dist/cli.js",
+    "typecheck": "tsc --noEmit",
+    "test": "npm run typecheck && tsx test/forwarder.test.ts && tsx test/audit-bench.ts",
     "clean": "rm -rf dist"
   },
   "dependencies": {

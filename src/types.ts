@@ -91,6 +91,8 @@ export interface VedisConfig {
   policy?: PolicyConfig;
   filter?: FilterConfig;
   audit?: AuditConfig;
+  /** Proxy -> cockpit telemetry forwarder (INGEST-API.md). Fail-open, never gates a call. */
+  ingest?: IngestConfig;
   rateLimit?: RateLimitConfig;
   /** Hybrid deployment: the Strix vedis-engine brain (deep LLM red-team). */
   brain?: import('./middleware/brain.js').BrainConfig;
@@ -139,6 +141,22 @@ export interface AuditConfig {
   enabled?: boolean;
   jsonl?: string;
   sqlite?: string;
+}
+
+/**
+ * Proxy -> cockpit telemetry forwarder (docs/INGEST-API.md). Telemetry only: per §7(a) it
+ * fails open unconditionally and VEDIS_FAIL_MODE does not apply to it.
+ */
+export interface IngestConfig {
+  enabled?: boolean;
+  /** POST target, e.g. https://cockpit.example/api/ingest/v1/calls */
+  endpoint?: string;
+  keyId?: string;
+  apiKey?: string;
+  proxyId?: string;
+  clientVersion?: string;
+  queueCap?: number;
+  spoolPath?: string;
 }
 
 export interface RateLimitConfig {
